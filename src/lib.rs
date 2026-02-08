@@ -2,29 +2,29 @@ use std::{
     cell::{Cell, RefCell, RefMut},
     cmp::Ordering,
     collections::VecDeque,
-    mem::replace,
+    mem::take,
     ops::{Deref, DerefMut},
 };
 
 use arrayvec::ArrayVec;
 use replace_with::replace_with_or_abort;
 
-const B: usize = 10;
+const B: usize = 150;
 
 pub struct Map<K, V> {
-    root: RefCell<Option<Box<Node<K, V>>>>,
+    root: RefCell<Option<Node<K, V>>>,
 }
 
 impl<K, V> Map<K, V> {
     pub fn new() -> Self {
         Map {
-            root: RefCell::new(Some(Box::new(Node {
+            root: RefCell::new(Some(Node {
                 buffer: Default::default(),
                 buffer_is_sorted: Cell::new(true),
                 array: Array::Leaf(LeafArray {
                     elements: Default::default(),
                 }),
-            }))),
+            })),
         }
     }
 }
@@ -48,7 +48,7 @@ impl<K: Ord, V> Map<K, V> {
         drop(root_borrow);
         while !new_branches.is_empty() {
             let new_array = InternalArray {
-                first_child: self.root.take().unwrap(),
+                first_child: Box::new(self.root.take().unwrap()),
                 elements: Default::default(),
             };
             new_branches = new_array.process_branches(new_branches.into_iter());
@@ -77,11 +77,11 @@ impl<K: Ord, V> Map<K, V> {
                 sr => sr,
             };
 
-            *self.root.borrow_mut() = Some(Box::new(Node {
+            *self.root.borrow_mut() = Some(Node {
                 buffer: Default::default(),
                 buffer_is_sorted: Cell::new(true),
                 array: Array::Internal(new_array),
-            }));
+            });
         }
 
         match search_result {
@@ -114,11 +114,11 @@ impl<K, V> Array<K, V> {
 
 struct InternalArray<K, V> {
     first_child: Box<Node<K, V>>,
-    elements: RefCell<ArrayVec<Branch<K, V>, B>>,
+    elements: RefCell<Box<ArrayVec<Branch<K, V>, B>>>,
 }
 
 struct LeafArray<K, V> {
-    elements: RefCell<ArrayVec<(K, V), B>>,
+    elements: RefCell<Box<ArrayVec<(K, V), B>>>,
 }
 
 struct Branch<K, V> {
@@ -339,18 +339,26 @@ impl<K: Ord, V> InternalArray<K, V> {
         let mut push_down = vec![];
         let mut push_to = &self.first_child;
 
-        let mut next_insert = buffer.next();
+        let mut next_insert = buffer.next().unwrap();
 
-        while let Some(ni) = &next_insert {
+        loop {
             if let Some(ae) = active_element {
-                if ni.0 < ae.key {
-                    let insert = replace(&mut next_insert, buffer.next()).unwrap();
-                    push_down.push(insert);
+                if next_insert.0 < ae.key {
+                    push_down.push(next_insert);
+                    if let Some(ni) = buffer.next() {
+                        next_insert = ni;
+                    } else {
+                        break;
+                    }
                     active_element = Some(ae);
-                } else if ni.0 == ae.key {
-                    let insert = replace(&mut next_insert, buffer.next()).unwrap();
-                    ae.key = insert.0;
-                    ae.value = MaybeBox::Inline(insert.1);
+                } else if next_insert.0 == ae.key {
+                    ae.key = next_insert.0;
+                    ae.value = MaybeBox::Inline(next_insert.1);
+                    if let Some(ni) = buffer.next() {
+                        next_insert = ni;
+                    } else {
+                        break;
+                    }
                     active_element = Some(ae);
                 } else {
                     if !push_down.is_empty() {
@@ -361,8 +369,12 @@ impl<K: Ord, V> InternalArray<K, V> {
                     active_element = elements_iter.next();
                 }
             } else {
-                let insert = replace(&mut next_insert, buffer.next()).unwrap();
-                push_down.push(insert);
+                push_down.push(next_insert);
+                if let Some(ni) = buffer.next() {
+                    next_insert = ni;
+                } else {
+                    break;
+                }
             }
         }
 
@@ -387,7 +399,7 @@ impl<K: Ord, V> InternalArray<K, V> {
                 let push_to = match &child.array {
                     Array::Internal(ia) => {
                         let mut elem_borrow = ia.elements.borrow_mut();
-                        let ptr = &mut *elem_borrow as *mut _;
+                        let ptr = &mut **elem_borrow as *mut _;
                         drop(elem_borrow);
                         ptr
                     }
@@ -416,7 +428,7 @@ impl<K: Ord, V> LeafArray<K, V> {
                 let push_to = match &child.array {
                     Array::Leaf(la) => {
                         let mut elem_borrow = la.elements.borrow_mut();
-                        let ptr = &mut *elem_borrow as *mut _;
+                        let ptr = &mut **elem_borrow as *mut _;
                         drop(elem_borrow);
                         ptr
                     }
@@ -438,12 +450,12 @@ impl<K: Ord, V> LeafArray<K, V> {
 
 #[allow(clippy::type_complexity)]
 fn process_buffer<I, K, V>(
-    mut elements_ref: RefMut<ArrayVec<I, B>>,
+    mut elements_ref: RefMut<Box<ArrayVec<I, B>>>,
     buffer: impl Iterator<Item = I>,
     branch_builder: fn(I) -> (Branch<K, V>, *mut ArrayVec<I, B>),
     item_comparator: fn(&I, &I) -> Ordering,
 ) -> Vec<Branch<K, V>> {
-    let mut elements_vec = elements_ref.take();
+    let mut elements_vec = take(&mut *elements_ref);
     let mut elements = elements_vec.drain(..);
     let mut buffer = buffer.peekable();
 
@@ -453,7 +465,7 @@ fn process_buffer<I, K, V>(
     let mut counter = 0;
 
     let mut result = vec![];
-    let mut push_to = &mut *elements_ref as *mut ArrayVec<I, B>;
+    let mut push_to = &mut **elements_ref as *mut ArrayVec<I, B>;
     let mut apply = |item| {
         if (counter + 1) % (B / 2 + 1) == 0 {
             let (new_branch, new_push_to) = branch_builder(item);
@@ -604,7 +616,7 @@ mod tests {
     #[test]
     fn insert_ordered_recursive_overflow() {
         let mut map = Map::new();
-        let max = 10 + B * B * B * 3;
+        let max = 10 + B * B * 3;
         for i in 10..max {
             map.insert(i, i * 2);
         }
@@ -621,7 +633,7 @@ mod tests {
     #[test]
     fn insert_ordered_recursive_overflow_get_random() {
         let mut map = Map::new();
-        let max = 10 + B * B * B * 3;
+        let max = 10 + B * B * 3;
         for i in 10..max {
             map.insert(i, i * 2);
         }
@@ -640,7 +652,7 @@ mod tests {
     fn alternate() {
         let mut map = Map::new();
 
-        for i in 0..B * B * B * 3 {
+        for i in 0..B * B * 3 {
             map.insert(i, i * 2);
             assert_eq!(map.get(&i), Some(&(i * 2)));
         }

@@ -21,7 +21,7 @@ harness = false
 
 [workspace]
 members = [".", "perf"]
-default-members = ["."]
+default-members = [".", "perf"]
 
 [dependencies]
 arrayvec = "0.7.6"
