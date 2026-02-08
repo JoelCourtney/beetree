@@ -1,0 +1,28 @@
+[package]
+name = "lazy_btree"
+version = "0.1.0"
+edition = "2024"
+
+[dev-dependencies]
+criterion = "0.8"
+rand = "0.9"
+
+[[bench]]
+name = "sorted_bulk"
+harness = false
+
+[[bench]]
+name = "random_bulk"
+harness = false
+
+[[bench]]
+name = "alternating"
+harness = false
+
+[workspace]
+members = [".", "perf"]
+default-members = ["."]
+
+[dependencies]
+arrayvec = "0.7.6"
+replace_with = "0.1.8"
