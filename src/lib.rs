@@ -180,32 +180,30 @@ impl<K: Ord, V> Node<K, V> {
         buffer.push_back((key, value));
     }
 
-    fn append(&self, vec: Vec<(K, V)>, is_sorted: bool) {
-        if vec.is_empty() {
-            return;
-        }
-
+    fn append(&self, thief: SliceThief<(K, V)>, is_sorted: bool) {
         let mut buffer = self.buffer.borrow_mut();
-        buffer.reserve(vec.len());
+        buffer.reserve(thief.len);
         if is_sorted
             && self.buffer_is_sorted.get()
             && let Some((front, _)) = buffer.front()
         {
-            if front >= &vec.last().unwrap().0 {
-                for (key, value) in vec.into_iter().rev() {
-                    buffer.push_front((key, value));
+            let last = thief.peek_last();
+            if front >= &last.0 {
+                for item in thief.rev() {
+                    buffer.push_front(item);
                 }
             } else {
                 let (back, _) = buffer.back().unwrap();
-                if back > &vec.first().unwrap().0 {
+                let first = thief.peek_first();
+                if back > &first.0 {
                     self.buffer_is_sorted.set(false);
                 }
-                buffer.extend(vec);
+                buffer.extend(thief);
             }
         } else {
             self.buffer_is_sorted
                 .set(is_sorted && self.buffer_is_sorted.get());
-            buffer.extend(vec);
+            buffer.extend(thief);
         }
     }
 
@@ -214,12 +212,14 @@ impl<K: Ord, V> Node<K, V> {
             Array::Internal(ia) => {
                 let mut buffer = self.buffer.borrow_mut();
                 if !buffer.is_empty() {
-                    if !self.buffer_is_sorted.get() {
-                        buffer
-                            .make_contiguous()
-                            .sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
-                    }
-                    ia.push_down(buffer.drain(..));
+                    replace_with_or_abort(&mut *buffer, |buffer| {
+                        let mut vec = Vec::from(buffer);
+                        if !self.buffer_is_sorted.get() {
+                            vec.sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
+                        }
+                        ia.push_down(&mut vec);
+                        VecDeque::from(vec)
+                    });
                 }
 
                 let mut elements = ia.elements.borrow_mut();
@@ -330,60 +330,182 @@ enum SearchResult<V> {
     None,
 }
 
+struct VecSlicer<'a, T> {
+    slice_start: usize,
+    current_index: usize,
+    vec: &'a mut Vec<T>,
+}
+
+impl<'a, T> VecSlicer<'a, T> {
+    fn new(vec: &'a mut Vec<T>) -> Self {
+        Self {
+            slice_start: 0,
+            current_index: 0,
+            vec,
+        }
+    }
+
+    fn advance(&mut self, count: usize) {
+        self.current_index += count;
+    }
+
+    fn slice(&mut self) -> SliceThief<T> {
+        let thief = SliceThief {
+            start: &self.vec[self.slice_start],
+            current: 0,
+            len: self.current_index - self.slice_start,
+        };
+        self.slice_start = self.current_index;
+        thief
+    }
+
+    fn take(&mut self) -> T {
+        debug_assert_eq!(self.slice_start, self.current_index);
+        let result = unsafe { (&self.vec[self.current_index] as *const T).read() };
+        self.slice_start += 1;
+        self.current_index = self.slice_start;
+        result
+    }
+
+    fn remaining(&self) -> usize {
+        self.vec.len() - self.current_index
+    }
+
+    fn current(&self) -> &T {
+        &self.vec[self.current_index]
+    }
+
+    fn slice_to_end(&mut self) -> SliceThief<T> {
+        self.current_index = self.vec.len();
+        self.slice()
+    }
+}
+
+impl<T> Drop for VecSlicer<'_, T> {
+    fn drop(&mut self) {
+        assert_eq!(self.current_index, self.vec.len());
+        assert_eq!(self.slice_start, self.vec.len());
+        unsafe {
+            self.vec.set_len(0);
+        }
+    }
+}
+
+struct SliceThief<T> {
+    start: *const T,
+    current: usize,
+    len: usize,
+}
+
+impl<T> SliceThief<T> {
+    fn peek_first(&self) -> &T {
+        assert_ne!(self.len, 0, "Cannot peek first element of empty slice");
+        assert_eq!(
+            self.current, 0,
+            "Cannot peek first element when it has already been consumed."
+        );
+        unsafe { &*self.start }
+    }
+
+    fn peek_last(&self) -> &T {
+        assert_ne!(self.len, 0, "Cannot peek last element of empty slice");
+        assert_ne!(
+            self.current, self.len,
+            "Cannot peek last element when it has already been consumed."
+        );
+        unsafe { &*self.start.add(self.len - 1) }
+    }
+}
+
+impl<T> Drop for SliceThief<T> {
+    fn drop(&mut self) {
+        assert_eq!(self.current, self.len);
+    }
+}
+
+impl<T> Iterator for SliceThief<T> {
+    type Item = T;
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.len, Some(self.len))
+    }
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current < self.len {
+            let result = unsafe { Some(self.start.add(self.current).read()) };
+            self.current += 1;
+            result
+        } else {
+            None
+        }
+    }
+}
+
+impl<T> ExactSizeIterator for SliceThief<T> {}
+
+impl<T> DoubleEndedIterator for SliceThief<T> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.current < self.len {
+            self.len -= 1;
+            unsafe { Some(self.start.add(self.len).read()) }
+        } else {
+            None
+        }
+    }
+}
+
 impl<K: Ord, V> InternalArray<K, V> {
-    fn push_down(&self, mut buffer: impl Iterator<Item = (K, V)>) {
+    fn push_down(&self, buffer: &mut Vec<(K, V)>) {
         let mut elements = self.elements.borrow_mut();
         let mut elements_iter = elements.iter_mut();
-        let mut active_element = elements_iter.next();
 
-        let mut push_down = vec![];
+        let mut slicer = VecSlicer::new(buffer);
+
         let mut push_to = &self.first_child;
 
-        let mut next_insert = buffer.next().unwrap();
-
-        loop {
-            if let Some(ae) = active_element {
-                if next_insert.0 < ae.key {
-                    push_down.push(next_insert);
-                    if let Some(ni) = buffer.next() {
-                        next_insert = ni;
+        if let Some(mut active_element) = elements_iter.next() {
+            loop {
+                let next_insert = slicer.current();
+                if next_insert.0 < active_element.key {
+                    slicer.advance(1);
+                    if slicer.remaining() == 0 {
+                        break;
+                    }
+                } else if next_insert.0 == active_element.key {
+                    let slice = slicer.slice();
+                    if slice.len() != 0 {
+                        push_to.append(slice, true);
+                    }
+                    let next_insert = slicer.take();
+                    active_element.key = next_insert.0;
+                    active_element.value = MaybeBox::Inline(next_insert.1);
+                    if slicer.remaining() == 0 {
+                        break;
+                    }
+                } else {
+                    let slice = slicer.slice();
+                    if slice.len() != 0 {
+                        push_to.append(slice, true);
+                    }
+                    push_to = &active_element.child;
+                    if let Some(ae) = elements_iter.next() {
+                        active_element = ae;
                     } else {
                         break;
                     }
-                    active_element = Some(ae);
-                } else if next_insert.0 == ae.key {
-                    ae.key = next_insert.0;
-                    ae.value = MaybeBox::Inline(next_insert.1);
-                    if let Some(ni) = buffer.next() {
-                        next_insert = ni;
-                    } else {
-                        break;
-                    }
-                    active_element = Some(ae);
-                } else {
-                    if !push_down.is_empty() {
-                        push_to.append(push_down, true);
-                        push_down = vec![];
-                    }
-                    push_to = &ae.child;
-                    active_element = elements_iter.next();
-                }
-            } else {
-                push_down.push(next_insert);
-                if let Some(ni) = buffer.next() {
-                    next_insert = ni;
-                } else {
-                    break;
                 }
             }
         }
 
-        if !push_down.is_empty() {
-            push_to.append(push_down, true);
+        let last_slice = slicer.slice_to_end();
+        if last_slice.len() != 0 {
+            push_to.append(last_slice, true);
         }
     }
 
-    fn process_branches(&self, branches: impl Iterator<Item = Branch<K, V>>) -> Vec<Branch<K, V>> {
+    fn process_branches(
+        &self,
+        branches: impl ExactSizeIterator<Item = Branch<K, V>>,
+    ) -> Vec<Branch<K, V>> {
         process_buffer(
             self.elements.borrow_mut(),
             branches,
@@ -413,7 +535,7 @@ impl<K: Ord, V> InternalArray<K, V> {
 }
 
 impl<K: Ord, V> LeafArray<K, V> {
-    fn process_buffer(&self, buffer: impl Iterator<Item = (K, V)>) -> Vec<Branch<K, V>> {
+    fn process_buffer(&self, buffer: impl ExactSizeIterator<Item = (K, V)>) -> Vec<Branch<K, V>> {
         process_buffer(
             self.elements.borrow_mut(),
             buffer,
@@ -451,11 +573,12 @@ impl<K: Ord, V> LeafArray<K, V> {
 #[allow(clippy::type_complexity)]
 fn process_buffer<I, K, V>(
     mut elements_ref: RefMut<Box<ArrayVec<I, B>>>,
-    buffer: impl Iterator<Item = I>,
+    buffer: impl ExactSizeIterator<Item = I>,
     branch_builder: fn(I) -> (Branch<K, V>, *mut ArrayVec<I, B>),
     item_comparator: fn(&I, &I) -> Ordering,
 ) -> Vec<Branch<K, V>> {
     let mut elements_vec = take(&mut *elements_ref);
+    let total_count = buffer.len() + elements_vec.len();
     let mut elements = elements_vec.drain(..);
     let mut buffer = buffer.peekable();
 
@@ -467,7 +590,7 @@ fn process_buffer<I, K, V>(
     let mut result = vec![];
     let mut push_to = &mut **elements_ref as *mut ArrayVec<I, B>;
     let mut apply = |item| {
-        if (counter + 1) % (B / 2 + 1) == 0 {
+        if (counter + 1) % (B / 2 + 1) == 0 && total_count - counter > B / 2 {
             let (new_branch, new_push_to) = branch_builder(item);
             push_to = new_push_to;
             result.push(new_branch);
@@ -653,8 +776,8 @@ mod tests {
         let mut map = Map::new();
 
         for i in 0..B * B * 3 {
-            map.insert(i, i * 2);
-            assert_eq!(map.get(&i), Some(&(i * 2)));
+            map.insert(i, i);
+            assert_eq!(map.get(&i), Some(&i));
         }
     }
 }
