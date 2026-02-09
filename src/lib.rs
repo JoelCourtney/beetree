@@ -17,6 +17,7 @@ const B: usize = 150;
 
 pub struct Map<K, V> {
     root: RefCell<Node<K, V>>,
+    length: usize,
 }
 
 impl<K, V> Map<K, V> {
@@ -29,6 +30,7 @@ impl<K, V> Map<K, V> {
                     elements: Default::default(),
                 }),
             }),
+            length: 0,
         }
     }
 }
@@ -42,18 +44,36 @@ impl<K, V> Default for Map<K, V> {
 impl<K: Ord, V> Map<K, V> {
     pub fn insert(&mut self, key: K, value: V) {
         self.root.borrow_mut().insert(key, value);
+        self.length += 1;
     }
 
     pub fn extend_from_vec(&mut self, vec: &mut Vec<(K, V)>) {
+        self.length += vec.len();
         self.root
             .borrow_mut()
-            .append(VecSlicer::new(vec).slice_to_end(), false)
+            .append(VecSlicer::new(vec).slice_to_end(), false);
     }
 
     pub fn extend_from_sorted_vec(&mut self, vec: &mut Vec<(K, V)>) {
+        self.length += vec.len();
         self.root
             .borrow_mut()
-            .append(VecSlicer::new(vec).slice_to_end(), true)
+            .append(VecSlicer::new(vec).slice_to_end(), true);
+    }
+
+    /// The number of elements stored or buffered in the map.
+    ///
+    /// This number is an upper bound estimate of the true logical length
+    /// of the map. If duplicate keys have been inserted but not [flush]ed,
+    /// then the actual number of elements that can be queried is less than
+    /// this number.
+    pub fn len(&self) -> usize {
+        self.length
+    }
+
+    /// Whether the map is empty.
+    pub fn is_empty(&self) -> bool {
+        self.length == 0
     }
 
     pub fn get(&self, key: &K) -> Option<&V> {
@@ -183,7 +203,7 @@ impl<K: Ord, V> Node<K, V> {
         if self.buffer_is_sorted.get()
             && let Some((front, _)) = buffer.front()
         {
-            if front >= &key {
+            if front > &key {
                 buffer.push_front((key, value));
                 return;
             } else {
@@ -204,7 +224,7 @@ impl<K: Ord, V> Node<K, V> {
             && let Some((front, _)) = buffer.front()
         {
             let last = thief.peek_last();
-            if front >= &last.0 {
+            if front > &last.0 {
                 for item in thief.rev() {
                     buffer.push_front(item);
                 }
@@ -554,6 +574,8 @@ fn process_buffer<I, K, V>(
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use rand::seq::SliceRandom;
 
     use crate::{B, Map};
@@ -687,5 +709,58 @@ mod tests {
             map.insert(i, i);
             assert_eq!(map.get(&i), Some(&i));
         }
+    }
+
+    #[test]
+    fn insert_duplicates() {
+        let mut map = Map::new();
+        map.insert(1, 2);
+        map.insert(1, 3);
+        assert_eq!(map.get(&1), Some(&3));
+    }
+
+    #[test]
+    fn insert_more_duplicates() {
+        let mut map = Map::new();
+        map.insert(1, 2);
+        map.insert(1, 3);
+        map.insert(2, 10);
+        map.insert(1, 4);
+        map.insert(1, 5);
+        assert_eq!(map.get(&1), Some(&5));
+    }
+
+    #[test]
+    fn insert_many_duplicates() {
+        let mut map = Map::new();
+        for i in 0..=B * B * 3 {
+            map.insert(1, i);
+        }
+        assert_eq!(map.get(&1), Some(&(B * B * 3)));
+    }
+
+    #[test]
+    fn drop_one() {
+        let item = Rc::new(0);
+        let mut map = Map::new();
+        map.insert(1, item.clone());
+        assert_eq!(map.get(&1), Some(&item));
+        drop(map);
+        assert_eq!(Rc::strong_count(&item), 1);
+    }
+
+    #[test]
+    fn drop_many() {
+        let item = Rc::new(0);
+        let mut map = Map::new();
+        for i in 0..B * B * 3 {
+            map.insert(i, item.clone());
+            map.insert(i, item.clone());
+        }
+        assert_eq!(Rc::strong_count(&item), B * B * 3 * 2 + 1);
+        assert_eq!(map.get(&1), Some(&item));
+        assert_eq!(Rc::strong_count(&item), B * B * 3 + 1);
+        drop(map);
+        assert_eq!(Rc::strong_count(&item), 1);
     }
 }
