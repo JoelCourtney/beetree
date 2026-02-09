@@ -25,19 +25,19 @@ fn criterion_benchmark(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("LazyMap", i), i, |b, i| {
             b.iter(|| build_lazy(black_box(*i)))
         });
-        group.bench_with_input(BenchmarkId::new("BTreeMap", i), i, |b, i| {
-            b.iter(|| build_std(black_box(*i)))
-        });
+        // group.bench_with_input(BenchmarkId::new("BTreeMap", i), i, |b, i| {
+            // b.iter(|| build_std(black_box(*i)))
+        // });
         group.bench_with_input(BenchmarkId::new("LazyMap-Get", i), i, |b, i| {
             b.iter(|| {
                 build_lazy(black_box(*i)).get(&2);
             })
         });
-        group.bench_with_input(BenchmarkId::new("BTreeMap-Get", i), i, |b, i| {
-            b.iter(|| {
-                build_std(black_box(*i)).get(&2);
-            })
-        });
+        // group.bench_with_input(BenchmarkId::new("BTreeMap-Get", i), i, |b, i| {
+            // b.iter(|| {
+                // build_std(black_box(*i)).get(&2);
+            // })
+        // });
     }
 
     group.finish();

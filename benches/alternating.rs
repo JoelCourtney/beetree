@@ -39,11 +39,11 @@ fn criterion_benchmark(c: &mut Criterion) {
                 run_lazy(black_box(*i)).get(&2);
             })
         });
-        group.bench_with_input(BenchmarkId::new("BTreeMap", i), i, |b, i| {
-            b.iter(|| {
-                run_std(black_box(*i)).get(&2);
-            })
-        });
+        // group.bench_with_input(BenchmarkId::new("BTreeMap", i), i, |b, i| {
+            // b.iter(|| {
+                // run_std(black_box(*i)).get(&2);
+            // })
+        // });
     }
 
     group.finish();
