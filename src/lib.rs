@@ -78,6 +78,11 @@ impl<K: Ord, V> Map<K, V> {
         self.length == 0
     }
 
+    /// Recursively processes all buffers in the map.
+    pub fn flush(&self) {
+        self.accept_visitor(&mut Flush);
+    }
+
     fn accept_visitor(&self, visitor: &mut impl Visitor<K, V>) {
         let mut root = self.root.borrow_mut();
         let mut new_branches = root.accept_visitor(visitor);
@@ -103,13 +108,24 @@ impl<K: Ord, V> Map<K, V> {
 }
 
 trait Visitor<K, V> {
-    fn visit_internal(&mut self, array: &mut [Branch<K, V>]) -> Motion;
+    fn visit_internal(&mut self, array: &mut [Branch<K, V>], temporary: bool) -> Motion;
     fn visit_leaf(&mut self, array: &mut [(K, V)]);
+}
+
+impl<K, V> Visitor<K, V> for Box<dyn Visitor<K, V>> {
+    fn visit_internal(&mut self, array: &mut [Branch<K, V>], temporary: bool) -> Motion {
+        (**self).visit_internal(array, temporary)
+    }
+
+    fn visit_leaf(&mut self, array: &mut [(K, V)]) {
+        (**self).visit_leaf(array);
+    }
 }
 
 enum Motion {
     Finish,
-    Down(usize),
+    VisitChild(usize),
+    VisitAll,
 }
 
 struct Node<K, V> {
@@ -136,9 +152,9 @@ impl<K: Ord, V> Node<K, V> {
 
                 let mut elements = internal.elements.borrow_mut();
 
-                match visitor.visit_internal(elements.as_mut_slice()) {
+                match visitor.visit_internal(elements.as_mut_slice(), false) {
                     Motion::Finish => vec![],
-                    Motion::Down(which) => {
+                    Motion::VisitChild(which) => {
                         let child = if which == 0 {
                             &*internal.first_child
                         } else {
@@ -147,6 +163,13 @@ impl<K: Ord, V> Node<K, V> {
                         let new_branches = child.accept_visitor(visitor);
                         drop(elements);
                         internal.process_branches(new_branches.into_iter())
+                    }
+                    Motion::VisitAll => {
+                        let mut new_branches = internal.first_child.accept_visitor(visitor);
+                        for branch in &**elements {
+                            new_branches.extend(branch.child.accept_visitor(visitor));
+                        }
+                        new_branches
                     }
                 }
             }
@@ -162,9 +185,9 @@ impl<K: Ord, V> Node<K, V> {
                     let mut new_branches = leaf.process_buffer(buffer.drain(..));
                     drop(buffer);
                     if !new_branches.is_empty() {
-                        match visitor.visit_internal(new_branches.as_mut_slice()) {
+                        match visitor.visit_internal(new_branches.as_mut_slice(), true) {
                             Motion::Finish => {}
-                            Motion::Down(which) => {
+                            Motion::VisitChild(which) => {
                                 let child = if which == 0 {
                                     self
                                 } else {
@@ -172,6 +195,12 @@ impl<K: Ord, V> Node<K, V> {
                                 };
                                 let should_be_empty = child.accept_visitor(visitor);
                                 debug_assert!(should_be_empty.is_empty());
+                            }
+                            Motion::VisitAll => {
+                                debug_assert!(self.accept_visitor(visitor).is_empty());
+                                for branch in &*new_branches {
+                                    debug_assert!(branch.child.accept_visitor(visitor).is_empty());
+                                }
                             }
                         }
                         return new_branches;
@@ -509,6 +538,25 @@ fn process_buffer<I, K, V>(
     }
 }
 
+struct Flush;
+
+impl<K, V> Visitor<K, V> for Flush {
+    #[inline]
+    fn visit_internal(&mut self, _array: &mut [Branch<K, V>], temporary: bool) -> Motion {
+        // Temporary internal nodes are the result of a leaf node's buffer being
+        // flushed. None of the children in a temporary internal node can have
+        // anything in their buffer.
+        if !temporary {
+            Motion::VisitAll
+        } else {
+            Motion::Finish
+        }
+    }
+
+    #[inline]
+    fn visit_leaf(&mut self, _array: &mut [(K, V)]) {}
+}
+
 #[cfg(test)]
 mod tests {
     use std::rc::Rc;
@@ -516,6 +564,69 @@ mod tests {
     use rand::seq::SliceRandom;
 
     use crate::{B, Map};
+
+    #[test]
+    fn flush_saga() {
+        let mut map = Map::new();
+
+        // STEP 1:
+        // Insert a bunch of duplicates into an empty map.
+        // Since there is only one node, when anything is queried
+        // the whole buffer is processed and not pushed down.
+        let x = Rc::new(0);
+        let y = Rc::new(1);
+        for _ in 0..1000 {
+            map.insert(0, x.clone());
+            map.insert(B * B, y.clone());
+        }
+        assert_eq!(Rc::strong_count(&x), 1001);
+        assert_eq!(Rc::strong_count(&y), 1001);
+        assert_eq!(**map.get(&(B * B)).unwrap(), 1);
+        assert_eq!(Rc::strong_count(&x), 2);
+        assert_eq!(Rc::strong_count(&y), 2);
+
+        // STEP 2:
+        // Fill the map with a bunch of junk and call flush.
+        // Flush fills out the structure of the map, which
+        // gives the buffered insertions in step 3 somewhere
+        // to be pushed down to during queries.
+        let max = 10 + B * B * 3;
+        for i in 10..max {
+            map.insert(i, Rc::new(i));
+        }
+        map.flush();
+
+        // STEP 3:
+        // Insert a bunch of duplicates into the structured map.
+        // The dups at index 0 and at index B*B should end up
+        // in different final leaf nodes.
+        // The query to index `max-1` should not touch either.
+        let x = Rc::new(0);
+        let y = Rc::new(1);
+        for _ in 0..1000 {
+            map.insert(0, x.clone());
+            map.insert(B * B, y.clone());
+        }
+        assert_eq!(**map.get(&(max - 1)).unwrap(), max - 1);
+        assert_eq!(Rc::strong_count(&x), 1001);
+        assert_eq!(Rc::strong_count(&y), 1001);
+
+        // STEP 4:
+        // Query B*B. This visits that leaf node and forces
+        // all the duplicates at B*B to be cleared.
+        assert_eq!(**map.get(&(B * B)).unwrap(), 1);
+        assert_eq!(Rc::strong_count(&x), 1001);
+        assert_eq!(Rc::strong_count(&y), 2);
+
+        // STEP 5:
+        // Flush again. Now the duplicates at index 0 should
+        // also be cleared, even though no query in this test
+        // touched that node.
+        map.flush();
+        assert_eq!(**map.get(&(B * B)).unwrap(), 1);
+        assert_eq!(Rc::strong_count(&x), 2);
+        assert_eq!(Rc::strong_count(&y), 2);
+    }
 
     #[test]
     fn insert_one() {

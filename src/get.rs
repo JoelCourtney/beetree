@@ -7,13 +7,13 @@ struct GetVisitor<'a, K, V> {
 
 impl<K: Ord, V> Visitor<K, V> for GetVisitor<'_, K, V> {
     #[inline]
-    fn visit_internal(&mut self, array: &mut [Branch<K, V>]) -> Motion {
+    fn visit_internal(&mut self, array: &mut [Branch<K, V>], _temporary: bool) -> Motion {
         match array.binary_search_by(|b| b.key.cmp(self.key)) {
             Ok(i) => {
                 self.result = Some(array[i].value.boxify());
                 Motion::Finish
             }
-            Err(i) => Motion::Down(i),
+            Err(i) => Motion::VisitChild(i),
         }
     }
 
@@ -32,13 +32,13 @@ struct GetKeyValueVisitor<'a, K, V> {
 
 impl<K: Ord + Clone, V> Visitor<K, V> for GetKeyValueVisitor<'_, K, V> {
     #[inline]
-    fn visit_internal(&mut self, array: &mut [Branch<K, V>]) -> Motion {
+    fn visit_internal(&mut self, array: &mut [Branch<K, V>], _temporary: bool) -> Motion {
         match array.binary_search_by(|b| b.key.cmp(self.key)) {
             Ok(i) => {
                 self.result = Some((array[i].boxify_key(), array[i].value.boxify()));
                 Motion::Finish
             }
-            Err(i) => Motion::Down(i),
+            Err(i) => Motion::VisitChild(i),
         }
     }
 
@@ -143,7 +143,7 @@ struct GetValueBeforeVisitor<'a, K, V> {
 
 impl<K: Ord, V> Visitor<K, V> for GetValueBeforeVisitor<'_, K, V> {
     #[inline]
-    fn visit_internal(&mut self, array: &mut [Branch<K, V>]) -> Motion {
+    fn visit_internal(&mut self, array: &mut [Branch<K, V>], _temporary: bool) -> Motion {
         match array.binary_search_by(|b| b.key.cmp(self.key)) {
             Ok(i) if self.inclusive => {
                 self.result = Some(array[i].value.boxify());
@@ -153,7 +153,7 @@ impl<K: Ord, V> Visitor<K, V> for GetValueBeforeVisitor<'_, K, V> {
                 if i != 0 {
                     self.previous_branch = Some(&mut array[i - 1]);
                 }
-                Motion::Down(i)
+                Motion::VisitChild(i)
             }
         }
     }
@@ -185,7 +185,7 @@ struct GetKeyValueBeforeVisitor<'a, K, V> {
 
 impl<K: Ord + Clone, V> Visitor<K, V> for GetKeyValueBeforeVisitor<'_, K, V> {
     #[inline]
-    fn visit_internal(&mut self, array: &mut [Branch<K, V>]) -> Motion {
+    fn visit_internal(&mut self, array: &mut [Branch<K, V>], _temporary: bool) -> Motion {
         match array.binary_search_by(|b| b.key.cmp(self.key)) {
             Ok(i) if self.inclusive => {
                 self.result = Some((array[i].boxify_key(), array[i].value.boxify()));
@@ -195,7 +195,7 @@ impl<K: Ord + Clone, V> Visitor<K, V> for GetKeyValueBeforeVisitor<'_, K, V> {
                 if i != 0 {
                     self.previous_branch = Some(&mut array[i - 1]);
                 }
-                Motion::Down(i)
+                Motion::VisitChild(i)
             }
         }
     }
