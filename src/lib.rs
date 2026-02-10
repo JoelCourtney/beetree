@@ -1,7 +1,8 @@
 mod vec_slicer;
+mod get;
 
 use std::{
-    cell::{Cell, Ref, RefCell, RefMut},
+    cell::{Cell, RefCell, RefMut},
     cmp::Ordering,
     collections::VecDeque,
     iter::Peekable,
@@ -77,9 +78,9 @@ impl<K: Ord, V> Map<K, V> {
         self.length == 0
     }
 
-    pub fn get(&self, key: &K) -> Option<&V> {
+    fn accept_visitor(&self, visitor: &mut impl Visitor<K, V>) {
         let mut root = self.root.borrow_mut();
-        let (mut search_result, mut new_branches) = root.search(key);
+        let mut new_branches = root.accept_visitor(visitor);
 
         while !new_branches.is_empty() {
             replace_with_or_abort(&mut *root, |root| {
@@ -87,19 +88,9 @@ impl<K: Ord, V> Map<K, V> {
                     first_child: Box::new(root),
                     elements: Default::default(),
                 };
-                new_branches = new_array.process_branches(new_branches.drain(..));
-
-                search_result = match search_result {
-                    SearchResult::HeadOfBranch => search_phantom_internal_node(
-                        new_branches.as_slice(),
-                        key,
-                        &*new_array.elements.borrow(),
-                        |b, key| b.key.cmp(key),
-                        |b| &*b.value,
-                        |arr| arr.unwrap_internal().elements.borrow(),
-                    ),
-                    sr => sr,
-                };
+                replace_with_or_abort(&mut new_branches, |mut branches| {
+                    new_array.process_branches(branches.drain(..))
+                });
 
                 Node {
                     buffer: Default::default(),
@@ -108,13 +99,17 @@ impl<K: Ord, V> Map<K, V> {
                 }
             });
         }
-
-        match search_result {
-            SearchResult::HeadOfBranch => unreachable!(),
-            SearchResult::Some(p) => Some(unsafe { &*p }),
-            SearchResult::None => None,
-        }
     }
+}
+
+trait Visitor<K, V> {
+    fn visit_internal(&mut self, array: &mut [Branch<K, V>]) -> Motion;
+    fn visit_leaf(&mut self, array: &mut [(K, V)]);
+}
+
+enum Motion {
+    Finish,
+    Down(usize),
 }
 
 struct Node<K, V> {
@@ -123,25 +118,75 @@ struct Node<K, V> {
     array: Array<K, V>,
 }
 
+impl<K: Ord, V> Node<K, V> {
+    fn accept_visitor(&self, visitor: &mut impl Visitor<K, V>) -> Vec<Branch<K, V>> {
+        match &self.array {
+            Array::Internal(internal) => {
+                let mut buffer = self.buffer.borrow_mut();
+                if !buffer.is_empty() {
+                    replace_with_or_abort(&mut *buffer, |buffer| {
+                        let mut vec = Vec::from(buffer);
+                        if !self.buffer_is_sorted.get() {
+                            vec.sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
+                        }
+                        internal.push_down(&mut vec);
+                        VecDeque::from(vec)
+                    });
+                }
+
+                let mut elements = internal.elements.borrow_mut();
+
+                match visitor.visit_internal(elements.as_mut_slice()) {
+                    Motion::Finish => vec![],
+                    Motion::Down(which) => {
+                        let child = if which == 0 {
+                            &*internal.first_child
+                        } else {
+                            &*elements[which - 1].child
+                        };
+                        let new_branches = child.accept_visitor(visitor);
+                        drop(elements);
+                        internal.process_branches(new_branches.into_iter())
+                    }
+                }
+            }
+            Array::Leaf(leaf) => {
+                let mut buffer = self.buffer.borrow_mut();
+
+                if !buffer.is_empty() {
+                    if !self.buffer_is_sorted.get() {
+                        buffer
+                            .make_contiguous()
+                            .sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
+                    }
+                    let mut new_branches = leaf.process_buffer(buffer.drain(..));
+                    drop(buffer);
+                    if !new_branches.is_empty() {
+                        match visitor.visit_internal(new_branches.as_mut_slice()) {
+                            Motion::Finish => {}
+                            Motion::Down(which) => {
+                                let child = if which == 0 {
+                                    self
+                                } else {
+                                    &*new_branches[which - 1].child
+                                };
+                                let should_be_empty = child.accept_visitor(visitor);
+                                debug_assert!(should_be_empty.is_empty());
+                            }
+                        }
+                        return new_branches;
+                    }
+                }
+                visitor.visit_leaf(leaf.elements.borrow_mut().as_mut_slice());
+                vec![]
+            }
+        }
+    }
+}
+
 enum Array<K, V> {
     Internal(InternalArray<K, V>),
     Leaf(LeafArray<K, V>),
-}
-
-impl<K, V> Array<K, V> {
-    fn unwrap_internal(&self) -> &InternalArray<K, V> {
-        match self {
-            Array::Internal(ia) => ia,
-            _ => unreachable!(),
-        }
-    }
-
-    fn unwrap_leaf(&self) -> &LeafArray<K, V> {
-        match self {
-            Array::Leaf(la) => la,
-            _ => unreachable!(),
-        }
-    }
 }
 
 struct InternalArray<K, V> {
@@ -165,11 +210,15 @@ enum MaybeBox<V> {
 }
 
 impl<V> MaybeBox<V> {
-    fn boxify(&mut self) {
+    fn boxify(&mut self) -> *mut V {
         replace_with_or_abort(self, |this| match this {
             MaybeBox::Inline(v) => MaybeBox::Boxed(Box::new(v)),
             mb => mb,
         });
+        match self {
+            MaybeBox::Boxed(b) => &mut **b,
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -238,133 +287,7 @@ impl<K: Ord, V> Node<K, V> {
             buffer.extend(thief);
         }
     }
-
-    fn search(&self, key: &K) -> (SearchResult<V>, Vec<Branch<K, V>>) {
-        match &self.array {
-            Array::Internal(ia) => {
-                let mut buffer = self.buffer.borrow_mut();
-                if !buffer.is_empty() {
-                    replace_with_or_abort(&mut *buffer, |buffer| {
-                        let mut vec = Vec::from(buffer);
-                        if !self.buffer_is_sorted.get() {
-                            vec.sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
-                        }
-                        ia.push_down(&mut vec);
-                        VecDeque::from(vec)
-                    });
-                }
-
-                let mut elements = ia.elements.borrow_mut();
-
-                match elements.binary_search_by(|branch| branch.key.cmp(key)) {
-                    Ok(i) => {
-                        let value = &mut elements[i].value;
-                        value.boxify();
-                        (SearchResult::Some(&**value), vec![])
-                    }
-                    Err(i) => {
-                        let (search_result, mut new_branches) = if i == 0 {
-                            ia.first_child.search(key)
-                        } else {
-                            elements[i - 1].child.search(key)
-                        };
-                        drop(elements);
-                        if !new_branches.is_empty() {
-                            new_branches = ia.process_branches(new_branches.into_iter());
-                        }
-
-                        let search_result = match search_result {
-                            SearchResult::HeadOfBranch => search_phantom_internal_node(
-                                new_branches.as_slice(),
-                                key,
-                                &*ia.elements.borrow(),
-                                |b, key| b.key.cmp(key),
-                                |b| &*b.value,
-                                |arr| arr.unwrap_internal().elements.borrow(),
-                            ),
-                            sr => sr,
-                        };
-
-                        (search_result, new_branches)
-                    }
-                }
-            }
-            Array::Leaf(la) => {
-                let mut buffer = self.buffer.borrow_mut();
-
-                if !buffer.is_empty() {
-                    if !self.buffer_is_sorted.get() {
-                        buffer
-                            .make_contiguous()
-                            .sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
-                    }
-                    let new_branches = la.process_buffer(buffer.drain(..));
-                    let search_result = search_phantom_internal_node(
-                        new_branches.as_slice(),
-                        key,
-                        &*la.elements.borrow(),
-                        |(k, _), key| k.cmp(key),
-                        |(_, v)| v,
-                        |arr| arr.unwrap_leaf().elements.borrow(),
-                    );
-                    (search_result, new_branches)
-                } else {
-                    let elements = la.elements.borrow();
-                    (
-                        elements
-                            .binary_search_by(|(k, _)| k.cmp(key))
-                            .ok()
-                            .map(|i| SearchResult::Some(&elements[i].1 as *const _))
-                            .unwrap_or(SearchResult::None),
-                        vec![],
-                    )
-                }
-            }
-        }
-    }
 }
-
-#[inline]
-#[allow(clippy::type_complexity)]
-fn search_phantom_internal_node<I, K: Ord, V>(
-    branches: &[Branch<K, V>],
-    key: &K,
-    first_child: &ArrayVec<I, B>,
-    item_comparator: fn(&I, &K) -> Ordering,
-    item_extractor: fn(&I) -> &V,
-    array_extractor: fn(&Array<K, V>) -> Ref<Box<ArrayVec<I, B>>>,
-) -> SearchResult<V> {
-    match branches.binary_search_by(|b| b.key.cmp(key)) {
-        Ok(_) => SearchResult::HeadOfBranch,
-        Err(0) => match first_child.binary_search_by(|item| item_comparator(item, key)) {
-            Ok(i) => SearchResult::Some(item_extractor(&first_child[i])),
-            _ => SearchResult::None,
-        },
-        Err(i) => {
-            let elements = array_extractor(&branches[i - 1].child.array);
-            let search_result = match elements.binary_search_by(|item| item_comparator(item, key)) {
-                Ok(i) => SearchResult::Some(item_extractor(&elements[i])),
-                _ => SearchResult::None,
-            };
-            drop(elements);
-            search_result
-        }
-    }
-}
-
-enum SearchResult<V> {
-    Some(*const V),
-    HeadOfBranch,
-    None,
-}
-
-impl<V> Clone for SearchResult<V> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<V> Copy for SearchResult<V> {}
 
 impl<K: Ord, V> InternalArray<K, V> {
     fn push_down(&self, buffer: &mut Vec<(K, V)>) {
@@ -583,86 +506,6 @@ mod tests {
     fn insert_one() {
         let mut map = Map::new();
         map.insert(2, 3);
-    }
-
-    #[test]
-    fn get_from_empty() {
-        let map: Map<usize, usize> = Map::new();
-        assert_eq!(map.get(&5), None);
-    }
-
-    #[test]
-    fn get_one() {
-        let mut map = Map::new();
-        map.insert(2, 3);
-
-        assert_eq!(map.get(&2), Some(&3));
-    }
-
-    #[test]
-    fn insert_ordered() {
-        let mut map = Map::new();
-        for i in 10..15 {
-            map.insert(i, i * 2);
-        }
-
-        assert_eq!(map.get(&12), Some(&24));
-        assert_eq!(map.get(&14), Some(&28));
-        assert_eq!(map.get(&16), None);
-        assert_eq!(map.get(&7), None);
-    }
-
-    #[test]
-    fn insert_ordered_overflow() {
-        let mut map = Map::new();
-        for i in 10..10 + B * 3 {
-            map.insert(i, i * 2);
-        }
-
-        let index: Vec<_> = (10..10 + B * 3).collect();
-        for i in index {
-            assert_eq!(map.get(&i), Some(&(i * 2)));
-        }
-
-        assert_eq!(map.get(&7), None);
-        assert_eq!(map.get(&(15 + B * 3)), None);
-    }
-
-    #[test]
-    fn insert_ordered_overflow_get_random() {
-        let mut map = Map::new();
-        for i in 10..10 + B * 3 {
-            map.insert(i, i * 2);
-        }
-
-        let mut index: Vec<_> = (10..10 + B * 3).collect();
-        index.shuffle(&mut rand::rng());
-        for i in index {
-            assert_eq!(map.get(&i), Some(&(i * 2)));
-        }
-
-        assert_eq!(map.get(&7), None);
-        assert_eq!(map.get(&(15 + B * 3)), None);
-    }
-
-    #[test]
-    fn get_head_of_branch() {
-        let mut map = Map::new();
-        for i in 0..(B * 3) {
-            map.insert(i, i * 2);
-        }
-
-        assert_eq!(map.get(&(B / 2)), Some(&B));
-    }
-
-    #[test]
-    fn get_in_new_branch() {
-        let mut map = Map::new();
-        for i in 0..(B * 3) {
-            map.insert(i, i * 2);
-        }
-
-        assert_eq!(map.get(&(B / 2 * 3)), Some(&(B * 3)));
     }
 
     #[test]
